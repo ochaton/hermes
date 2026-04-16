@@ -1,0 +1,6 @@
+hermes
+hermes-*
+temp/
+temp2/
+*.hermes.tmp
+.DS_Store

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,7 +43,13 @@ func Share(args []string) {
 	}
 
 	if strings.HasPrefix(*addr, "0.0.0.0") {
-		fmt.Fprintln(os.Stderr, "warning: --addr is 0.0.0.0 — receiver will not be able to connect; use your public IP")
+		ip, err := outboundIP()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "warning: --addr is 0.0.0.0 and could not detect outbound IP:", err)
+		} else {
+			_, port, _ := strings.Cut(*addr, ":")
+			*addr = ip + ":" + port
+		}
 	}
 
 	path := fs.Arg(0)
@@ -101,28 +108,32 @@ func Share(args []string) {
 		}
 		defer f.Close()
 
+		length := end - start + 1
+
+		// First pass: compute xxHash64 over the range.
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		length := end - start + 1
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(f, buf); err != nil {
+		h := xxhash.New()
+		if _, err := io.Copy(h, io.LimitReader(f, length)); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		h := xxhash.New()
-		h.Write(buf)
 		etag := fmt.Sprintf("%016x", h.Sum64())
+
+		// Second pass: stream bytes directly to response.
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		fmt.Fprintf(os.Stderr, "serving range %d-%d to %s\n", start, end, r.RemoteAddr)
 
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, entry.size))
 		w.WriteHeader(http.StatusPartialContent)
-		w.Write(buf)
+		io.Copy(w, io.LimitReader(f, length))
 	})
 
 	tlsCfg, err := selfSignedTLS()
@@ -150,6 +161,18 @@ func Share(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// outboundIP returns the preferred local IP used for outbound connections
+// by dialing a UDP "connection" (no packets sent) and reading the local address.
+func outboundIP() (string, error) {
+	conn, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return "", err
+	}
+	conn.Close()
+	host, _, err := net.SplitHostPort(conn.LocalAddr().String())
+	return host, err
 }
 
 func selfSignedTLS() (*tls.Config, error) {

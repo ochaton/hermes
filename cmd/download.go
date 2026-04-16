@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/quic-go/quic-go/http3"
@@ -112,8 +113,12 @@ func Download(args []string) {
 
 	client := &http.Client{
 		Transport: &http3.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS13,
+			},
 		},
+		Timeout: 30 * time.Second,
 	}
 	defer client.CloseIdleConnections()
 
@@ -254,7 +259,6 @@ func fetchMeta(client *http.Client, baseURL, token string) (*fileMeta, error) {
 	var m fileMeta
 	return &m, json.NewDecoder(resp.Body).Decode(&m)
 }
-
 
 func verifyFile(name, token string) error {
 	f, err := os.Open(name)

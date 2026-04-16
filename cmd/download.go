@@ -49,13 +49,13 @@ func (t chunkTask) do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	dst, err := os.OpenFile(t.tmpName, os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	h := xxhash.New()
 	cw := &countingWriter{
@@ -215,7 +215,7 @@ func startProgressDisplay(downloaded *atomic.Int64, total int64) func() {
 func Download(args []string) {
 	fs := flag.NewFlagSet("download", flag.ExitOnError)
 	streams := fs.Int("streams", 8, "number of parallel streams")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: hermes download [--streams N] <ip:port/token>")
@@ -256,12 +256,12 @@ func Download(args []string) {
 		os.Exit(1)
 	}
 	if err := tmp.Truncate(meta.Size); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	tmp.Close() // each worker opens its own fd
+	_ = tmp.Close() // each worker opens its own fd
 
 	numChunks := int((meta.Size + defaultChunkSize - 1) / defaultChunkSize)
 	nWorkers := min(*streams, numChunks)
@@ -353,14 +353,14 @@ func Download(args []string) {
 	stopProgress()
 
 	if err := <-errCh; err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	fmt.Fprintf(os.Stderr, "verifying file checksum...\n")
 	if err := verifyFile(tmpName, token); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		fmt.Fprintln(os.Stderr, "checksum mismatch:", err)
 		os.Exit(1)
 	}
@@ -378,7 +378,7 @@ func fetchMeta(client *http.Client, baseURL, token string) (*fileMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var m fileMeta
 	return &m, json.NewDecoder(resp.Body).Decode(&m)
 }
@@ -388,7 +388,7 @@ func verifyFile(name, token string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := xxhash.New()
 	if _, err := io.Copy(h, f); err != nil {

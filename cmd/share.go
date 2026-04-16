@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,7 +37,7 @@ type shareEntry struct {
 func Share(args []string) {
 	fs := flag.NewFlagSet("share", flag.ExitOnError)
 	addr := fs.String("addr", "0.0.0.0:4443", "listen address ip:port")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: hermes share --addr <ip:port> <file>")
@@ -71,7 +73,7 @@ func Share(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	f.Close()
+	_ = f.Close()
 	token := fmt.Sprintf("%016x", h.Sum64())
 
 	entry := shareEntry{
@@ -84,33 +86,44 @@ func Share(args []string) {
 
 	mux.HandleFunc("/"+token+"/meta", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"filename": entry.filename,
 			"size":     entry.size,
 		})
 	})
 
+	contentType := mime.TypeByExtension(filepath.Ext(entry.filename))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
 	mux.HandleFunc("/"+token, func(w http.ResponseWriter, r *http.Request) {
-		rangeHdr := r.Header.Get("Range")
-		if rangeHdr == "" {
-			http.Error(w, "Range header required", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-
-		var start, end int64
-		end = entry.size - 1
-		fmt.Sscanf(strings.TrimPrefix(rangeHdr, "bytes="), "%d-%d", &start, &end)
-
 		f, err := os.Open(entry.path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, entry.filename))
+		w.Header().Set("Accept-Ranges", "bytes")
+
+		rangeHdr := r.Header.Get("Range")
+		if rangeHdr == "" {
+			// Full file — browser opening the URL directly.
+			fmt.Fprintf(os.Stderr, "serving full file to %s\n", r.RemoteAddr)
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", entry.size))
+			_, _ = io.Copy(w, f)
+			return
+		}
+
+		var start, end int64
+		end = entry.size - 1
+		_, _ = fmt.Sscanf(strings.TrimPrefix(rangeHdr, "bytes="), "%d-%d", &start, &end)
 		length := end - start + 1
 
-		// First pass: compute xxHash64 over the range.
+		// First pass: compute xxHash64 over the range (for hermes download verification).
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -122,7 +135,7 @@ func Share(args []string) {
 		}
 		etag := fmt.Sprintf("%016x", h.Sum64())
 
-		// Second pass: stream bytes directly to response.
+		// Second pass: stream bytes to response.
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -131,9 +144,10 @@ func Share(args []string) {
 		fmt.Fprintf(os.Stderr, "serving range %d-%d to %s\n", start, end, r.RemoteAddr)
 
 		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", length))
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, entry.size))
 		w.WriteHeader(http.StatusPartialContent)
-		io.Copy(w, io.LimitReader(f, length))
+		_, _ = io.Copy(w, io.LimitReader(f, length))
 	})
 
 	tlsCfg, err := selfSignedTLS()
@@ -142,7 +156,29 @@ func Share(args []string) {
 		os.Exit(1)
 	}
 
-	srv := &http3.Server{
+	_, port, _ := net.SplitHostPort(*addr)
+
+	// TCP server: HTTP/1.1 + HTTP/2, advertises HTTP/3 via Alt-Svc.
+	tcpTLSCfg := tlsCfg.Clone()
+	tcpTLSCfg.NextProtos = []string{"h2", "http/1.1"}
+	tcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%s"`, port))
+		mux.ServeHTTP(w, r)
+	})
+	tcpSrv := &http.Server{Addr: *addr, Handler: tcpHandler}
+	ln, err := tls.Listen("tcp", *addr, tcpTLSCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	go func() {
+		if err := tcpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintln(os.Stderr, "tcp:", err)
+		}
+	}()
+
+	// UDP server: HTTP/3 (QUIC).
+	h3Srv := &http3.Server{
 		Addr:      *addr,
 		TLSConfig: tlsCfg,
 		Handler:   mux,
@@ -154,10 +190,11 @@ func Share(args []string) {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 		<-ch
-		srv.Close()
+		_ = h3Srv.Close()
+		_ = tcpSrv.Close()
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := h3Srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -170,7 +207,7 @@ func outboundIP() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	conn.Close()
+	_ = conn.Close()
 	host, _, err := net.SplitHostPort(conn.LocalAddr().String())
 	return host, err
 }

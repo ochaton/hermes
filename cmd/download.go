@@ -34,7 +34,6 @@ type chunkTask struct {
 	tmpName    string
 	start      int64
 	end        int64
-	total      int64
 	downloaded *atomic.Int64
 	retry      int
 }
@@ -59,20 +58,45 @@ func (t chunkTask) do(ctx context.Context) error {
 	defer dst.Close()
 
 	h := xxhash.New()
-	n, err := io.Copy(io.MultiWriter(&offsetWriter{f: dst, offset: t.start}, h), resp.Body)
-	if err != nil {
+	cw := &countingWriter{
+		w:       io.MultiWriter(&offsetWriter{f: dst, offset: t.start}, h),
+		counter: t.downloaded,
+	}
+	if _, err := io.Copy(cw, resp.Body); err != nil {
+		cw.rollback()
 		return err
 	}
 
 	etag := resp.Header.Get("ETag")
 	got := fmt.Sprintf("%016x", h.Sum64())
 	if etag != "" && got != etag {
+		cw.rollback()
 		return fmt.Errorf("chunk %d-%d: checksum mismatch", t.start, t.end)
 	}
 
-	cur := t.downloaded.Add(n)
-	fmt.Fprintf(os.Stderr, "\r%d / %d bytes (%d%%)", cur, t.total, cur*100/t.total)
 	return nil
+}
+
+// countingWriter updates an atomic counter on every Write call.
+// Call rollback to subtract the accumulated tally on failure.
+type countingWriter struct {
+	w       io.Writer
+	counter *atomic.Int64
+	n       int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	if n > 0 {
+		cw.n += int64(n)
+		cw.counter.Add(int64(n))
+	}
+	return n, err
+}
+
+func (cw *countingWriter) rollback() {
+	cw.counter.Add(-cw.n)
+	cw.n = 0
 }
 
 type chunkResult struct {
@@ -80,9 +104,8 @@ type chunkResult struct {
 	err  error
 }
 
-// offsetWriter implements io.Writer on top of *os.File at a fixed offset,
-// advancing the offset as bytes are written. Allows io.Copy into a specific
-// region of a file without seeking.
+// offsetWriter writes to a fixed offset in a file, advancing on each call.
+// Allows concurrent range writes without seek races.
 type offsetWriter struct {
 	f      *os.File
 	offset int64
@@ -92,6 +115,101 @@ func (w *offsetWriter) Write(p []byte) (int, error) {
 	n, err := w.f.WriteAt(p, w.offset)
 	w.offset += int64(n)
 	return n, err
+}
+
+func fmtBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f Gbyte", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f Mbyte", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f Kbyte", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d byte", n)
+	}
+}
+
+// speedTracker computes average throughput over the last 5 seconds using a
+// fixed-size ring buffer of (time, cumulative-bytes) samples, one per second.
+type speedTracker struct {
+	samples [5]struct {
+		t time.Time
+		n int64
+	}
+	count int
+	pos   int
+}
+
+func (s *speedTracker) record(n int64) {
+	s.samples[s.pos] = struct {
+		t time.Time
+		n int64
+	}{time.Now(), n}
+	s.pos = (s.pos + 1) % 5
+	if s.count < 5 {
+		s.count++
+	}
+}
+
+func (s *speedTracker) speed() float64 {
+	if s.count < 2 {
+		return 0
+	}
+	oldest := ((s.pos-s.count)%5 + 5) % 5
+	newest := (s.pos - 1 + 5) % 5
+	dt := s.samples[newest].t.Sub(s.samples[oldest].t).Seconds()
+	if dt <= 0 {
+		return 0
+	}
+	return float64(s.samples[newest].n-s.samples[oldest].n) / dt
+}
+
+func renderProgress(cur, total int64, speed float64) {
+	pct := int(cur * 100 / total)
+	const width = 30
+	filled := width * pct / 100
+	var bar strings.Builder
+	bar.WriteString(strings.Repeat("=", filled))
+	if filled < width {
+		bar.WriteByte('>')
+		bar.WriteString(strings.Repeat(" ", width-filled-1))
+	}
+	speedStr := ""
+	if speed > 0 {
+		speedStr = fmt.Sprintf(" | %s/s", fmtBytes(int64(speed)))
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[K[%s] %s / %s (%d%%%s)",
+		bar.String(), fmtBytes(cur), fmtBytes(total), pct, speedStr)
+}
+
+// startProgressDisplay refreshes the progress line once per second.
+// The returned function stops the goroutine and prints the final state.
+func startProgressDisplay(downloaded *atomic.Int64, total int64) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var tracker speedTracker
+		for {
+			select {
+			case <-stop:
+				renderProgress(downloaded.Load(), total, 0)
+				fmt.Fprintln(os.Stderr)
+				return
+			case <-ticker.C:
+				n := downloaded.Load()
+				tracker.record(n)
+				renderProgress(n, total, tracker.speed())
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
 }
 
 func Download(args []string) {
@@ -122,11 +240,14 @@ func Download(args []string) {
 	}
 	defer client.CloseIdleConnections()
 
+	fmt.Fprintf(os.Stderr, "fetching meta from %s...\n", addrPort)
+	metaStart := time.Now()
 	meta, err := fetchMeta(client, baseURL, token)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "fetch meta:", err)
 		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stderr, "meta fetched in %.2fs\n", time.Since(metaStart).Seconds())
 
 	tmpName := "." + meta.Filename + ".hermes.tmp"
 	tmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
@@ -144,10 +265,13 @@ func Download(args []string) {
 
 	numChunks := int((meta.Size + defaultChunkSize - 1) / defaultChunkSize)
 	nWorkers := min(*streams, numChunks)
+	fmt.Fprintf(os.Stderr, "downloading %q (%s) using %d streams\n", meta.Filename, fmtBytes(meta.Size), nWorkers)
 
 	var downloaded atomic.Int64
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	stopProgress := startProgressDisplay(&downloaded, meta.Size)
 
 	// workCh is unbuffered: manager dispatches one task at a time via select.
 	// feedbackCh is buffered at nWorkers so workers never block sending results.
@@ -155,7 +279,6 @@ func Download(args []string) {
 	feedbackCh := make(chan chunkResult, nWorkers)
 	errCh := make(chan error, 1)
 
-	// Workers: each opens its own file descriptor per task received.
 	var wg sync.WaitGroup
 	for range nWorkers {
 		wg.Go(func() {
@@ -180,7 +303,6 @@ func Download(args []string) {
 				tmpName:    tmpName,
 				start:      start,
 				end:        end,
-				total:      meta.Size,
 				downloaded: &downloaded,
 			}
 		}
@@ -228,6 +350,7 @@ func Download(args []string) {
 	}()
 
 	wg.Wait()
+	stopProgress()
 
 	if err := <-errCh; err != nil {
 		os.Remove(tmpName)
@@ -235,7 +358,7 @@ func Download(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "\nverifying file checksum...\n")
+	fmt.Fprintf(os.Stderr, "verifying file checksum...\n")
 	if err := verifyFile(tmpName, token); err != nil {
 		os.Remove(tmpName)
 		fmt.Fprintln(os.Stderr, "checksum mismatch:", err)

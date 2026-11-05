@@ -3,11 +3,17 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/ochaton/hermes/cmd"
 )
 
 func main() {
+	// quic-go moves every UDP packet between goroutines; with more Ps on macOS that
+	// costs a thread wakeup per packet, which caps a 1 Gbit/s link at ~60 MB/s.
+	if os.Getenv("GOMAXPROCS") == "" {
+		runtime.GOMAXPROCS(1)
+	}
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: hermes <share|download> [options]\n")
 		os.Exit(1)

@@ -4,7 +4,7 @@ Fast peer-to-peer file transfer over HTTP/3 (QUIC) with multistream parallel dow
 
 ## Install
 
-**From source** (requires Go 1.22+):
+**From source** (requires Go 1.26.2+):
 ```sh
 go install github.com/ochaton/hermes@latest
 ```

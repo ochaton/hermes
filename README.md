@@ -26,10 +26,12 @@ By default the address is `0.0.0.0:4443` and hermes auto-detects the outbound IP
 ### Download a file
 
 ```sh
-hermes download [--streams N] <ip:port/token>
+hermes download [--streams N] [--conns M] <ip:port/token>
 ```
 
-Downloads the file using `N` parallel QUIC streams (default 8). Each chunk is verified with xxHash64. The file is written atomically — saved only after a full-file checksum passes.
+Downloads the file using `N` parallel QUIC streams (default 8) spread over `M` QUIC connections (default 2). Each chunk is verified with xxHash64. The file is written atomically — saved only after a full-file checksum passes.
+
+hermes runs with `GOMAXPROCS=1` unless the `GOMAXPROCS` environment variable is set: quic-go's per-packet goroutine handoffs are much cheaper on a single P, which matters most on macOS.
 
 ## Example
 

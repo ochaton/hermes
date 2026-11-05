@@ -215,10 +215,11 @@ func startProgressDisplay(downloaded *atomic.Int64, total int64) func() {
 func Download(args []string) {
 	fs := flag.NewFlagSet("download", flag.ExitOnError)
 	streams := fs.Int("streams", 8, "number of parallel streams")
+	conns := fs.Int("conns", 2, "number of QUIC connections; streams are spread across them")
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: hermes download [--streams N] <ip:port/token>")
+		fmt.Fprintln(os.Stderr, "usage: hermes download [--streams N] [--conns N] <ip:port/token>")
 		os.Exit(1)
 	}
 
@@ -229,16 +230,20 @@ func Download(args []string) {
 	}
 	baseURL := "https://" + addrPort
 
-	client := &http.Client{
-		Transport: &http3.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS13,
+	clients := make([]*http.Client, max(*conns, 1))
+	for i := range clients {
+		clients[i] = &http.Client{
+			Transport: &http3.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					MinVersion:         tls.VersionTLS13,
+				},
 			},
-		},
-		Timeout: 30 * time.Second,
+			Timeout: 30 * time.Second,
+		}
+		defer clients[i].CloseIdleConnections()
 	}
-	defer client.CloseIdleConnections()
+	client := clients[0]
 
 	fmt.Fprintf(os.Stderr, "fetching meta from %s...\n", addrPort)
 	metaStart := time.Now()
@@ -280,9 +285,11 @@ func Download(args []string) {
 	errCh := make(chan error, 1)
 
 	var wg sync.WaitGroup
-	for range nWorkers {
+	for w := range nWorkers {
+		c := clients[w%len(clients)]
 		wg.Go(func() {
 			for task := range workCh {
+				task.client = c
 				feedbackCh <- chunkResult{task, task.do(ctx)}
 			}
 		})
@@ -297,7 +304,6 @@ func Download(args []string) {
 			start := int64(i) * defaultChunkSize
 			end := min(start+defaultChunkSize-1, meta.Size-1)
 			pending[i] = chunkTask{
-				client:     client,
 				baseURL:    baseURL,
 				token:      token,
 				tmpName:    tmpName,

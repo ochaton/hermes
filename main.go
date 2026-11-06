@@ -15,16 +15,17 @@ func main() {
 		runtime.GOMAXPROCS(1)
 	}
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: hermes <share|download> [options]\n")
-		os.Exit(1)
+		fmt.Print(cmd.Usage)
+		return
 	}
 	switch os.Args[1] {
-	case "share":
-		cmd.Share(os.Args[2:])
-	case "download":
-		cmd.Download(os.Args[2:])
+	case "send", "share":
+		cmd.Send(os.Args[2:])
+	case "get", "download":
+		cmd.Get(os.Args[2:])
+	case "-h", "-help", "--help", "help":
+		fmt.Print(cmd.Usage)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		os.Exit(1)
+		cmd.Get(os.Args[1:])
 	}
 }

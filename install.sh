@@ -17,7 +17,7 @@ if ! curl -fsL "https://github.com/ochaton/hermes/releases/download/v0.9.0-ux.1/
 	echo "download failed. go install github.com/ochaton/hermes@experiment/ux-send"
 	exit 1
 fi
-chmod +x "$tmp"
+chmod 755 "$tmp"
 
 dest=
 for d in /opt/homebrew/bin /usr/local/bin; do

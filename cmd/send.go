@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -257,12 +258,39 @@ func walk(args []string) (meta, error) {
 	return m, nil
 }
 
-// localIP picks the address receivers should dial: the outbound IPv4, else the
-// first private IPv4, else a global IPv6, else loopback.
+// localIP picks the address receivers should dial: a private IPv4 on a real
+// broadcast interface (the outbound one if it is among them), else the outbound
+// IPv4, else the first private IPv4, else a global IPv6, else loopback.
 func localIP() string {
+	out := ""
 	if c, err := net.Dial("udp4", "8.8.8.8:53"); err == nil {
-		defer func() { _ = c.Close() }()
-		return c.LocalAddr().(*net.UDPAddr).IP.String()
+		out = c.LocalAddr().(*net.UDPAddr).IP.String()
+		_ = c.Close()
+	}
+	virtual := []string{"utun", "tun", "tap", "wg", "tailscale", "docker", "br-", "bridge", "veth", "vmnet", "awdl", "llw", "vethernet", "wsl", "hyper-v"}
+	var lan []string
+	ifs, _ := net.Interfaces()
+	for _, ifc := range ifs {
+		name := strings.ToLower(ifc.Name)
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || ifc.Flags&net.FlagBroadcast == 0 ||
+			slices.ContainsFunc(virtual, func(v string) bool { return strings.Contains(name, v) }) {
+			continue
+		}
+		as, _ := ifc.Addrs()
+		for _, a := range as {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && n.IP.IsPrivate() {
+				lan = append(lan, n.IP.To4().String())
+			}
+		}
+	}
+	if slices.Contains(lan, out) {
+		return out
+	}
+	if len(lan) > 0 {
+		return lan[0]
+	}
+	if out != "" {
+		return out
 	}
 	addrs, _ := net.InterfaceAddrs()
 	v6 := ""

@@ -12,9 +12,9 @@ arm64 | aarch64) arch=arm64 ;;
 esac
 
 tmp=$(mktemp) || exit 1
-if ! curl -fsL "https://github.com/ochaton/hermes/releases/download/v0.9.0-ux.1/hermes-$os-$arch" -o "$tmp"; then
+if ! curl -fsL "https://github.com/ochaton/hermes/releases/download/v0.9.0-ticket.1/hermes-$os-$arch" -o "$tmp"; then
 	rm -f "$tmp"
-	echo "download failed. go install github.com/ochaton/hermes@experiment/ux-send"
+	echo "download failed. go install github.com/ochaton/hermes@experiment/ux-ticket"
 	exit 1
 fi
 chmod 755 "$tmp"

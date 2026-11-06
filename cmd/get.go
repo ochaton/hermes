@@ -34,43 +34,34 @@ func Get(args []string) {
 	out := flags.String("o", ".", "output directory")
 	streams := flags.Int("streams", 8, "parallel streams")
 	conns := flags.Int("conns", 2, "QUIC connections; streams are spread across them")
-	wait := flags.Duration("wait", 3*time.Second, "how long to look for the sender")
 	pos := parseArgs(flags, args)
 	if len(pos) != 1 {
 		flags.Usage()
 		os.Exit(1)
 	}
+	target := pos[0]
+	hosts, token := parseTicket(target)
+	if addr, tok, ok := strings.Cut(target, "/"); ok {
+		hosts, token = []string{addr}, tok
+	}
+	if hosts == nil {
+		fail(fmt.Errorf("not a ticket: %s", target))
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
 	defer stop()
 
-	target := pos[0]
-	if !strings.Contains(target, "/") {
-		code := strings.ToLower(target)
-		if !isCode(code) {
-			fail(fmt.Errorf("not a code: %s", target))
-		}
-		var err error
-		if target, err = discover(ctx, code, *wait); err != nil {
-			fail(err)
-		}
-	}
-	addr, token, _ := strings.Cut(target, "/")
-	base := "https://" + addr + "/" + token
-
-	clients := make([]*http.Client, max(*conns, 1))
-	for i := range clients {
-		clients[i] = &http.Client{Transport: &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	}
-	m, err := fetchMeta(ctx, clients[0], base)
-	if err != nil && ctx.Err() == nil {
-		clients = []*http.Client{{Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConnsPerHost: *streams,
-		}}}
-		m, err = fetchMeta(ctx, clients[0], base)
-	}
+	c, base, m, err := race(ctx, hosts, token, *streams)
 	if err != nil {
+		if ctx.Err() != nil {
+			err = errors.New("cancelled")
+		}
 		fail(err)
+	}
+	clients := []*http.Client{c}
+	if _, ok := c.Transport.(*http3.Transport); ok {
+		for range *conns - 1 {
+			clients = append(clients, newClient(true, 0))
+		}
 	}
 	if len(m.Files) == 0 {
 		fail(errors.New("nothing to receive"))
@@ -153,6 +144,63 @@ func Get(args []string) {
 	} else {
 		fmt.Println(line)
 	}
+}
+
+func newClient(quic bool, streams int) *http.Client {
+	tlsCfg := &tls.Config{InsecureSkipVerify: true}
+	if quic {
+		return &http.Client{Transport: &http3.Transport{TLSClientConfig: tlsCfg}}
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: streams}}
+}
+
+// race fetches meta from every host over QUIC at once and, from 400ms on, over TCP.
+// The first 200 wins; every other attempt is cancelled and its transport closed.
+func race(ctx context.Context, hosts []string, token string, streams int) (*http.Client, string, meta, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type win struct {
+		c    *http.Client
+		base string
+		m    meta
+	}
+	won := make(chan win, 1)
+	var first atomic.Bool
+	var wg sync.WaitGroup
+	start := func(quic bool) {
+		for _, h := range hosts {
+			wg.Go(func() {
+				c, base := newClient(quic, streams), "https://"+h+"/"+token
+				actx, acancel := context.WithTimeout(ctx, 3*time.Second)
+				m, err := fetchMeta(actx, c, base)
+				acancel()
+				if err == nil && first.CompareAndSwap(false, true) {
+					won <- win{c, base, m}
+					cancel()
+					return
+				}
+				if t, ok := c.Transport.(io.Closer); ok {
+					_ = t.Close()
+				}
+				c.CloseIdleConnections()
+			})
+		}
+	}
+	start(true)
+	go func() {
+		select {
+		case <-time.After(400 * time.Millisecond):
+			start(false)
+		case <-ctx.Done():
+		}
+		wg.Wait()
+		close(won)
+	}()
+	w, ok := <-won
+	if !ok {
+		return nil, "", meta{}, errors.New("not found")
+	}
+	return w.c, w.base, w.m, nil
 }
 
 func fetchMeta(ctx context.Context, c *http.Client, base string) (meta, error) {

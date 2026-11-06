@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Usage = "hermes send <file-or-folder>...\nhermes get <code>\n"
+const Usage = "hermes send <file-or-folder>...\nhermes get <ticket>\n"
 
 var (
 	jsonOut bool

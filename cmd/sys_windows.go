@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"os"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
@@ -16,19 +15,4 @@ func enableVT() bool {
 		return false
 	}
 	return windows.SetConsoleMode(h, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING) == nil
-}
-
-func udpControl(_, _ string, c syscall.RawConn) error {
-	var serr error
-	err := c.Control(func(fd uintptr) {
-		for _, opt := range []int{windows.SO_REUSEADDR, windows.SO_BROADCAST} {
-			if serr == nil {
-				serr = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, opt, 1)
-			}
-		}
-	})
-	if err != nil {
-		return err
-	}
-	return serr
 }

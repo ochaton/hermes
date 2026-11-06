@@ -21,7 +21,6 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,7 +64,6 @@ func Send(args []string) {
 	var tok [8]byte
 	_, _ = rand.Read(tok[:])
 	token := hex.EncodeToString(tok[:])
-	code := newCode()
 
 	var mu sync.Mutex
 	var cur *progress
@@ -162,12 +160,14 @@ func Send(args []string) {
 		}
 	}
 
-	host := localIP()
-	url := net.JoinHostPort(host, strconv.Itoa(bound)) + "/" + token
+	t := ticket(bound, tok[:])
+	if t == "" {
+		fail(errors.New("no address"))
+	}
 	if jsonOut {
-		emit("event", "ready", "code", code, "url", url)
+		emit("event", "ready", "ticket", t)
 	} else {
-		fmt.Printf("%s\nhermes get %s\nhermes get %s\n", code, code, url)
+		fmt.Println("hermes get " + t)
 	}
 
 	tcpTLS := tlsCfg.Clone()
@@ -176,9 +176,6 @@ func Send(args []string) {
 	h3Srv := &http3.Server{TLSConfig: tlsCfg, Handler: mux}
 	go func() { _ = tcpSrv.Serve(tls.NewListener(tcpLn, tcpTLS)) }()
 	go func() { _ = h3Srv.Serve(udpConn) }()
-	if !strings.Contains(host, ":") {
-		go beacon(code, host, bound, token)
-	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, stopSignals...)
@@ -256,60 +253,6 @@ func walk(args []string) (meta, error) {
 		m.Name = "files"
 	}
 	return m, nil
-}
-
-// localIP picks the address receivers should dial: a private IPv4 on a real
-// broadcast interface (the outbound one if it is among them), else the outbound
-// IPv4, else the first private IPv4, else a global IPv6, else loopback.
-func localIP() string {
-	out := ""
-	if c, err := net.Dial("udp4", "8.8.8.8:53"); err == nil {
-		out = c.LocalAddr().(*net.UDPAddr).IP.String()
-		_ = c.Close()
-	}
-	virtual := []string{"utun", "tun", "tap", "wg", "tailscale", "docker", "br-", "bridge", "veth", "vmnet", "awdl", "llw", "vethernet", "wsl", "hyper-v"}
-	var lan []string
-	ifs, _ := net.Interfaces()
-	for _, ifc := range ifs {
-		name := strings.ToLower(ifc.Name)
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || ifc.Flags&net.FlagBroadcast == 0 ||
-			slices.ContainsFunc(virtual, func(v string) bool { return strings.Contains(name, v) }) {
-			continue
-		}
-		as, _ := ifc.Addrs()
-		for _, a := range as {
-			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && n.IP.IsPrivate() {
-				lan = append(lan, n.IP.To4().String())
-			}
-		}
-	}
-	if slices.Contains(lan, out) {
-		return out
-	}
-	if len(lan) > 0 {
-		return lan[0]
-	}
-	if out != "" {
-		return out
-	}
-	addrs, _ := net.InterfaceAddrs()
-	v6 := ""
-	for _, a := range addrs {
-		n, ok := a.(*net.IPNet)
-		if !ok || n.IP.IsLoopback() {
-			continue
-		}
-		if ip := n.IP.To4(); ip != nil && ip.IsPrivate() {
-			return ip.String()
-		}
-		if v6 == "" && n.IP.To4() == nil && n.IP.IsGlobalUnicast() {
-			v6 = n.IP.String()
-		}
-	}
-	if v6 != "" {
-		return v6
-	}
-	return "127.0.0.1"
 }
 
 func selfSignedTLS() (*tls.Config, error) {
